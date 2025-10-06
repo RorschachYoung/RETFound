@@ -193,9 +193,44 @@ torchrun --nproc_per_node=1 --master_port=48766 main_finetune.py \
   --data_path "${DATA_PATH}" \
   --input_size 224 \
   --task "${TASK}" \
-  --adaptation "${ADAPTATION}" 
+  --adaptation "${ADAPTATION}"
 
 ```
+
+### 🔍 使用 Optuna 进行多任务回归微调的超参数搜索
+
+项目中的脚本 `多卡微调RETFound应用于回归任务.py` 已经集成了 [Optuna](https://optuna.org/) 搜索逻辑，便于在表格+影像回归任务中自动调节关键超参数。【F:多卡微调RETFound应用于回归任务.py†L517-L543】
+
+1. **安装依赖**：确保已经安装 Optuna，例如 `pip install optuna`。
+2. **准备数据**：使用脚本要求的 CSV（包含 `path`、`split` 以及目标列）并指定 `--csv_file` 等常规训练参数。
+3. **启动搜索**：通过 `--optuna_trials` 指定试验次数即可触发超参优化，例如：
+
+   ```bash
+   python 多卡微调RETFound应用于回归任务.py \
+     --csv_file data/retina.csv \
+     --batch_size 32 \
+     --epochs 40 \
+     --optuna_trials 20 \
+     --optuna_epochs 10 \
+     --optuna_direction maximize
+   ```
+
+   其中 `--optuna_epochs` 可在搜索时缩短单次试验的迭代轮数，`--optuna_direction` 控制目标（默认最大化验证集 macro R²）。
+
+Optuna 会自动尝试下列超参数并回传验证集 macro R² 作为目标值：学习率 `lr`、权重衰减 `weight_decay`、层级学习率衰减 `layer_decay`、
+DropPath `drop_path`、头部 dropout `head_dropout`、Transformer 头深度 `head_depth`、MLP 扩张比 `head_mlp_ratio`、注意力头数 `head_num_heads` 以及 Huber 损失的 `beta`。【F:多卡微调RETFound应用于回归任务.py†L928-L948】
+
+搜索完成后，脚本会在终端打印最优结果，并在输出目录保存 `optuna_best.json`，其中包含最佳分数和对应的参数组合，方便在正式训练阶段复现最优设定。【F:多卡微调RETFound应用于回归任务.py†L972-L980】
+
+#### 常见问题（FAQ）
+
+- **Optuna 给出的最佳超参数就是最终模型的设置吗？**  
+  最优 trial 保存的就是当次搜索中表现最佳的完整配置；文件 `optuna_best.json` 记录了这些值，可直接复用到后续训练脚本的命令行参数中。【F:多卡微调RETFound应用于回归任务.py†L928-L980】
+- **是否需要再用最佳超参数训练一次？**  
+  搜索阶段通常会把 `--optuna_epochs` 设为比正式训练更短的轮数，以便快速比较候选组合；`run_optuna` 会在为每个 trial 克隆参数时覆盖 `epochs` 字段。【F:多卡微调RETFound应用于回归任务.py†L909-L946】因此在拿到最佳超参数后，建议关闭 Optuna（去掉 `--optuna_trials`）并按照目标 `--epochs` 重新运行脚本，以完整训练最终模型。
+- **搜索时间与手动调参相比如何？**  
+  脚本会按 `n_trials × optuna_epochs` 训练批次数量来决定整体耗时；若手动调参通常需要完整 `epochs` 训练 (记为 `full_epochs`)，则自动搜索的大致耗时比例约为 `(n_trials × optuna_epochs) / full_epochs`。例如 20 次 trial、每次 10 轮，对应约等于训练 200 轮；若正式训练为 80 轮，则搜索阶段耗时约为 2.5 倍。【F:多卡微调RETFound应用于回归任务.py†L909-L945】
+
 
 
 
