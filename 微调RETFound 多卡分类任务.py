@@ -15,10 +15,11 @@ from contextlib import nullcontext
 import numpy as np
 import pandas as pd
 from PIL import Image
-from typing import Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.backends.cudnn as cudnn
+import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import Dataset, WeightedRandomSampler
 from torch.utils.data.sampler import RandomSampler, SequentialSampler
@@ -27,7 +28,10 @@ from timm.models.layers import trunc_normal_
 from timm.data import create_transform
 from timm.data.mixup import Mixup
 from timm.loss import SoftTargetCrossEntropy
+import timm
 from huggingface_hub import hf_hub_download
+
+import re
 
 try:
     import optuna  # type: ignore
@@ -144,6 +148,188 @@ class CSVDataset(Dataset):
         return counts
 
 
+class TabTransformerClassifierHead(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        num_classes: int,
+        embed_dim: Optional[int] = None,
+        depth: int = 2,
+        num_heads: int = 4,
+        mlp_ratio: float = 2.0,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        embed_dim = embed_dim or in_dim
+        self.num_classes = num_classes
+
+        self.proj = nn.Linear(in_dim, embed_dim)
+        self.class_tokens = nn.Parameter(torch.zeros(num_classes, embed_dim))
+        trunc_normal_(self.class_tokens, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            activation="gelu",
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        tokens = x.unsqueeze(1) + self.class_tokens.unsqueeze(0)
+        z = self.encoder(tokens)
+        z = self.norm(z)
+        logits = self.head(z).squeeze(-1)
+        return logits
+
+
+class EfficientNetTabClassifier(nn.Module):
+    def __init__(self, backbone: nn.Module, head: nn.Module):
+        super().__init__()
+        self.backbone = backbone
+        self.head = head
+        self._use_generic_lrd = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.backbone(x)
+        return self.head(features)
+
+    def no_weight_decay(self) -> set:
+        nwd = set()
+        if hasattr(self.backbone, "no_weight_decay"):
+            nwd.update({f"backbone.{k}" for k in self.backbone.no_weight_decay()})
+        if hasattr(self.head, "no_weight_decay"):
+            nwd.update({f"head.{k}" for k in self.head.no_weight_decay()})
+        return nwd
+
+
+_DECAY_EXCLUDES = ("bias", "bn", "norm", "ln", "embedding")
+
+
+def _is_no_weight_decay(name: str, param: nn.Parameter, extra_nowd: Iterable[str]) -> bool:
+    if param.ndim == 1:
+        return True
+    lname = name.lower()
+    if lname.endswith(".bias"):
+        return True
+    if any(k in lname for k in _DECAY_EXCLUDES):
+        return True
+    if extra_nowd and name in set(extra_nowd):
+        return True
+    return False
+
+
+def _count_attr_len(obj: nn.Module, attr: str) -> int:
+    m = getattr(obj, attr, None)
+    if m is None:
+        return 0
+    try:
+        return len(m)
+    except TypeError:
+        return 0
+
+
+def _infer_layering(model: nn.Module) -> Tuple[int, List[Tuple[re.Pattern, int]]]:
+    backbone = getattr(model, "backbone", model)
+
+    n_blocks = _count_attr_len(backbone, "blocks")
+    if n_blocks > 0:
+        num_layers = n_blocks + 1
+        rules = [
+            (re.compile(r"(?:^|\.)(?:backbone\.)?blocks\.(\d+)\."), 1),
+        ]
+        return num_layers, rules
+
+    n_stages = _count_attr_len(backbone, "stages")
+    if n_stages > 0:
+        num_layers = n_stages + 1
+        rules = [
+            (re.compile(r"(?:^|\.)(?:backbone\.)?stages\.(\d+)\."), 1),
+        ]
+        return num_layers, rules
+
+    n_blocks2 = _count_attr_len(backbone, "blocks")
+    if n_blocks2 > 0:
+        num_layers = n_blocks2 + 1
+        rules = [
+            (re.compile(r"(?:^|\.)(?:backbone\.)?blocks\.(\d+)\."), 1),
+        ]
+        return num_layers, rules
+
+    if all(hasattr(backbone, f"layer{i}") for i in range(1, 5)):
+        num_layers = 5
+        rules = [
+            (re.compile(r"(?:^|\.)(?:backbone\.)?layer1\."), 1),
+            (re.compile(r"(?:^|\.)(?:backbone\.)?layer2\."), 2),
+            (re.compile(r"(?:^|\.)(?:backbone\.)?layer3\."), 3),
+            (re.compile(r"(?:^|\.)(?:backbone\.)?layer4\."), 4),
+        ]
+        return num_layers, rules
+
+    return 1, []
+
+
+def _get_layer_id(name: str, num_layers: int, rules: List[Tuple[re.Pattern, int]]) -> int:
+    lname = name.lower()
+    if ".head." in lname or lname.startswith("head."):
+        return max(0, num_layers - 1)
+    if ".classifier." in lname or lname.startswith("classifier."):
+        return max(0, num_layers - 1)
+
+    for pat, base in rules:
+        m = pat.search(name)
+        if m:
+            if m.groups():
+                try:
+                    idx = int(m.group(1))
+                    return min(base + idx, max(0, num_layers - 1))
+                except Exception:
+                    return base
+            return base
+
+    return 0
+
+
+def param_groups_lrd_generic(
+    model: nn.Module,
+    weight_decay: float = 0.05,
+    no_weight_decay_list: Iterable[str] = (),
+    layer_decay: float = 1.0,
+):
+    num_layers, rules = _infer_layering(model)
+    if num_layers < 1:
+        num_layers = 1
+
+    layer_scales = [layer_decay ** (num_layers - 1 - i) for i in range(num_layers)]
+
+    buckets: Dict[Tuple[int, bool], Dict[str, object]] = {}
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        layer_id = _get_layer_id(name, num_layers, rules)
+        is_no_decay = _is_no_weight_decay(name, p, no_weight_decay_list)
+        key = (layer_id, is_no_decay)
+        if key not in buckets:
+            buckets[key] = {
+                "params": [],
+                "weight_decay": 0.0 if is_no_decay else weight_decay,
+                "lr_scale": layer_scales[layer_id],
+            }
+        buckets[key]["params"].append(p)
+
+    groups = [g for g in buckets.values() if g["params"]]
+    if not groups:
+        params = [p for _, p in model.named_parameters() if p.requires_grad]
+        groups = [{"params": params, "weight_decay": weight_decay, "lr_scale": 1.0}]
+    return groups
+
+
 def build_transforms(args):
     # 没有 --norm 时回退 IMAGENET
     norm_name = getattr(args, "norm", "IMAGENET")
@@ -234,7 +420,7 @@ def get_args_parser():
 
     # Model
     parser.add_argument("--model", default="RETFound_dinov2", type=str,
-                        help="RETFound_dinov2 / RETFound_mae / Dinov2 / Dinov3 ...")
+                        help="RETFound_dinov2 / RETFound_mae / Dinov2 / Dinov3 / efficientnet_b4_tab ...")
     parser.add_argument("--model_arch", default="dinov2_vitb14", type=str)
     parser.add_argument("--input_size", default=256, type=int)
     parser.add_argument("--drop_path", type=float, default=0.2)
@@ -269,8 +455,8 @@ def get_args_parser():
     parser.add_argument("--mixup_mode", type=str, default="batch")
 
     # Finetune
-    parser.add_argument("--finetune", default="RETFound_dinov2", type=str,
-                        help="RETFound_dinov2 / RETFound_mae will be downloaded from HF")
+    parser.add_argument("--finetune", default="", type=str,
+                        help="Pretrained checkpoint path or identifier (defaults to model-specific preset)")
     parser.add_argument("--task", default="csv_paths_run", type=str)
     parser.add_argument("--adaptation", default="finetune", choices=["finetune", "lp"])
 
@@ -359,6 +545,10 @@ def run_experiment(args: argparse.Namespace, trial: Optional["optuna.trial.Trial
         if trial is not None:
             print(f"[Optuna] Running trial #{trial.number}")
 
+    args.finetune = args.finetune or ""
+    if not args.finetune and args.model in ["RETFound_dinov2", "RETFound_mae"]:
+        args.finetune = args.model
+
     if trial is not None:
         args.blr = trial.suggest_float("blr", 5e-4, 5e-3, log=True)
         args.weight_decay = trial.suggest_float("weight_decay", 1e-6, 5e-2, log=True)
@@ -430,7 +620,31 @@ def run_experiment(args: argparse.Namespace, trial: Optional["optuna.trial.Trial
             criterion = torch.nn.CrossEntropyLoss(label_smoothing=args.smoothing)
 
         # ====== 模型 ======
-        if args.model == "RETFound_mae":
+        use_generic_lrd = False
+        if args.model == "efficientnet_b4_tab":
+            if misc.is_main_process():
+                print("[Model] Creating EfficientNet-B4 backbone with TabTransformer head")
+            backbone = timm.create_model(
+                "efficientnet_b4", pretrained=True, num_classes=0, drop_path_rate=args.drop_path
+            )
+            feat_dim = backbone.num_features
+            head = TabTransformerClassifierHead(
+                in_dim=feat_dim,
+                num_classes=args.nb_classes,
+                embed_dim=feat_dim,
+                depth=2,
+                num_heads=4,
+                mlp_ratio=2.0,
+                dropout=0.1,
+            )
+            for module in head.modules():
+                if isinstance(module, nn.Linear):
+                    trunc_normal_(module.weight, std=0.02)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+            model = EfficientNetTabClassifier(backbone, head)
+            use_generic_lrd = True
+        elif args.model == "RETFound_mae":
             model = models.__dict__[args.model](
                 img_size=args.input_size, num_classes=args.nb_classes,
                 drop_path_rate=args.drop_path, global_pool=args.global_pool,
@@ -444,44 +658,54 @@ def run_experiment(args: argparse.Namespace, trial: Optional["optuna.trial.Trial
         if args.finetune and not args.eval:
             if misc.is_main_process():
                 print(f"[Load Pretrain] {args.finetune}")
-            if args.model in ["Dinov3", "Dinov2"]:
-                checkpoint_path = args.finetune
-            elif args.model in ["RETFound_dinov2", "RETFound_mae"]:
-                checkpoint_path = hf_hub_download(
-                    repo_id=f"YukunZhou/{args.finetune}",
-                    filename=f"{args.finetune}.pth",
-                )
-            else:
-                raise ValueError("Unsupported model for finetuning")
-
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-            if args.model in ["Dinov3", "Dinov2"]:
-                checkpoint_model = checkpoint
-            elif args.model == "RETFound_dinov2":
-                checkpoint_model = checkpoint["teacher"]
-            else:
-                checkpoint_model = checkpoint["model"]
-
-            ckpt = {k.replace("backbone.", ""): v for k, v in checkpoint_model.items()}
-            ckpt = {k.replace("mlp.w12.", "mlp.fc1."): v for k, v in ckpt.items()}
-            ckpt = {k.replace("mlp.w3.", "mlp.fc2."): v for k, v in ckpt.items()}
-
-            # 删除不匹配的分类头
-            state_dict = model.state_dict()
-            for k in ["head.weight", "head.bias"]:
-                if k in ckpt and ckpt[k].shape != state_dict[k].shape:
+            if args.model == "efficientnet_b4_tab":
+                if os.path.isfile(args.finetune):
+                    checkpoint = torch.load(args.finetune, map_location="cpu")
+                    state_dict = checkpoint.get("model", checkpoint)
+                    missing, unexpected = model.load_state_dict(state_dict, strict=False)
                     if misc.is_main_process():
-                        print(f"[Pretrain] remove {k}")
-                    del ckpt[k]
+                        print(f"[Load Pretrain] missing keys: {missing}")
+                        print(f"[Load Pretrain] unexpected keys: {unexpected}")
+                else:
+                    if misc.is_main_process():
+                        print(f"[WARN] finetune path {args.finetune} not found; using timm pretrained weights")
+            else:
+                if args.model in ["Dinov3", "Dinov2"]:
+                    checkpoint_path = args.finetune
+                elif args.model in ["RETFound_dinov2", "RETFound_mae"]:
+                    checkpoint_path = hf_hub_download(
+                        repo_id=f"YukunZhou/{args.finetune}",
+                        filename=f"{args.finetune}.pth",
+                    )
+                else:
+                    raise ValueError("Unsupported model for finetuning")
 
-            interpolate_pos_embed(model, ckpt)
-            _ = model.load_state_dict(ckpt, strict=False)
+                checkpoint = torch.load(checkpoint_path, map_location="cpu")
+                if args.model in ["Dinov3", "Dinov2"]:
+                    checkpoint_model = checkpoint
+                elif args.model == "RETFound_dinov2":
+                    checkpoint_model = checkpoint["teacher"]
+                else:
+                    checkpoint_model = checkpoint["model"]
 
-            # 重新初始化分类头
-            if hasattr(model, "head") and hasattr(model.head, "weight"):
-                trunc_normal_(model.head.weight, std=2e-5)
-                if getattr(model.head, "bias", None) is not None:
-                    torch.nn.init.zeros_(model.head.bias)
+                ckpt = {k.replace("backbone.", ""): v for k, v in checkpoint_model.items()}
+                ckpt = {k.replace("mlp.w12.", "mlp.fc1."): v for k, v in ckpt.items()}
+                ckpt = {k.replace("mlp.w3.", "mlp.fc2."): v for k, v in ckpt.items()}
+
+                state_dict = model.state_dict()
+                for k in ["head.weight", "head.bias"]:
+                    if k in ckpt and ckpt[k].shape != state_dict[k].shape:
+                        if misc.is_main_process():
+                            print(f"[Pretrain] remove {k}")
+                        del ckpt[k]
+
+                interpolate_pos_embed(model, ckpt)
+                _ = model.load_state_dict(ckpt, strict=False)
+
+                if hasattr(model, "head") and hasattr(model.head, "weight"):
+                    trunc_normal_(model.head.weight, std=2e-5)
+                    if getattr(model.head, "bias", None) is not None:
+                        torch.nn.init.zeros_(model.head.bias)
 
         # ====== DDP 包装（如启用）
         model.to(device)
@@ -494,6 +718,8 @@ def run_experiment(args: argparse.Namespace, trial: Optional["optuna.trial.Trial
                 model, device_ids=[args.gpu] if torch.cuda.is_available() else None, **ddp_kwargs
             )
             model_without_ddp = model.module
+
+        use_generic_lrd = use_generic_lrd or getattr(model_without_ddp, "_use_generic_lrd", False)
 
         # ====== Sampler / DataLoader（单/多卡）======
         if args.distributed:
@@ -592,13 +818,23 @@ def run_experiment(args: argparse.Namespace, trial: Optional["optuna.trial.Trial
                   f"world_size: {world_size}  eff_bs: {eff_bs}")
 
         no_weight_decay = (model_without_ddp.no_weight_decay() if hasattr(model_without_ddp, "no_weight_decay") else [])
-        param_groups = lrd.param_groups_lrd(
-            model_without_ddp, weight_decay=args.weight_decay,
-            no_weight_decay_list=no_weight_decay, layer_decay=args.layer_decay,
-        )
+        if use_generic_lrd:
+            param_groups = param_groups_lrd_generic(
+                model_without_ddp, weight_decay=args.weight_decay,
+                no_weight_decay_list=no_weight_decay, layer_decay=args.layer_decay,
+            )
+        else:
+            param_groups = lrd.param_groups_lrd(
+                model_without_ddp, weight_decay=args.weight_decay,
+                no_weight_decay_list=no_weight_decay, layer_decay=args.layer_decay,
+            )
         for g in param_groups:
             g["params"] = [p for p in g["params"] if p.requires_grad]
         optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
+        if use_generic_lrd:
+            for pg in optimizer.param_groups:
+                scale = pg.get("lr_scale", 1.0)
+                pg["lr"] = args.lr * scale
         loss_scaler = NativeScaler()
         if misc.is_main_process():
             print(f"criterion = {criterion}")
